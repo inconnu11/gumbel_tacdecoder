@@ -211,7 +211,7 @@ class Solver(object):
             self.model = self.model.to(self.device)
 
             # x_identic = self.G(x_f0_intrp_org, x_real_org, emb_org)
-            mel_outputs, feature_predicts, ortho_inputs_integrals, mask_parts, invert_masks = self.model(x_f0_intrp_org, x_real_org, emb_org)
+            mel_outputs, feature_predicts, ortho_inputs_integrals, mask_parts, invert_masks = self.model(x_f0_intrp_org, x_real_org, emb_org, len_org, len_org, len_org)
             loss_main_id = F.mse_loss(x_real_org, mel_outputs, reduction='mean')
 
             loss_ortho_id_L1 = self.loss_o(ortho_inputs_integrals[0].cuda(),

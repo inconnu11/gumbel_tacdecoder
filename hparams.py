@@ -20,6 +20,30 @@ hparams = HParams(
     dim_enc_2 = 128,   # (conv dim) rhythm (encoder_2,encoder_t)
     dim_enc_3 = 256,   # (conv dim) pitch
 
+    # Decoder parameters
+    n_frames_per_step=1,  # currently only 1 is supported
+    decoder_rnn_dim=1024,
+    prenet_dim=256,
+    max_decoder_steps=1000,
+    gate_threshold=0.5,
+    p_attention_dropout=0.1,
+    p_decoder_dropout=0.1,
+
+    # Attention parameters
+    attention_rnn_dim=1024,
+    attention_dim=128,
+
+    # Location Layer parameters
+    attention_location_n_filters=32,
+    attention_location_kernel_size=31,
+
+    # Mel-post processing network parameters
+    postnet_embedding_dim=512,
+    postnet_kernel_size=5,
+    postnet_n_convolutions=5,
+
+    n_mel_channels=80,
+
     # x(mel) : 80维
     dim_freq = 80,
     dim_spk_emb = 107, # 82 at first

@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="root@106.14.224.71:36871">
+  <component name="PublishConfigData" serverName="root@106.14.224.71:36871">
     <serverData>
       <paths name="gum-att">
         <serverdata>
           <mappings>
-            <mapping deploy="/workspace/cpfs-data/gumbel_softmax_Embedding" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/workspace/cpfs-data/gumbel_tacdecoder" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
@@ -17,6 +17,5 @@
         </serverdata>
       </paths>
     </serverData>
-    <option name="myAutoUpload" value="ALWAYS" />
   </component>
 </project>

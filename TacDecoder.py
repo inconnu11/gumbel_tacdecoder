@@ -4,7 +4,8 @@ from torch.autograd import Variable
 from torch import nn
 from torch.nn import functional as F
 from layers import ConvNorm, LinearNorm
-from utils import to_gpu, get_mask_from_lengths
+# from utils import to_gpu, get_mask_from_lengths
+from taco2.utils import to_gpu, get_mask_from_lengths_taco
 
 
 class LocationLayer(nn.Module):
@@ -404,8 +405,11 @@ class Decoder(nn.Module):
         decoder_inputs = torch.cat((decoder_input, decoder_inputs), dim=0)
         decoder_inputs = self.prenet(decoder_inputs)
 
+        # self.initialize_decoder_states(
+        #     memory, mask=~get_mask_from_lengths(memory_lengths))
         self.initialize_decoder_states(
-            memory, mask=~get_mask_from_lengths(memory_lengths))
+            memory, mask=~get_mask_from_lengths_taco(memory_lengths))
+
 
         mel_outputs, gate_outputs, alignments = [], [], []
         while len(mel_outputs) < decoder_inputs.size(0) - 1:

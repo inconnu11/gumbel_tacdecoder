@@ -3,16 +3,122 @@ import torch.nn as nn
 import torch.nn.functional as F
 # import torch.autograd.Function as Function
 import numpy as np
-from hparams import hparams
+from hparams import hparams, hparams_debug_string
 import math
 from math import ceil 
-from utils import get_mask_from_lengths
+from taco2.utils import get_mask_from_lengths_taco
 from torch.autograd import Variable
+
+
+class LocationLayer(nn.Module):
+    def __init__(self, attention_n_filters, attention_kernel_size,
+                 attention_dim):
+        super(LocationLayer, self).__init__()
+        padding = int((attention_kernel_size - 1) / 2)
+        self.location_conv = ConvNorm(2, attention_n_filters,
+                                      kernel_size=attention_kernel_size,
+                                      padding=padding, bias=False, stride=1,
+                                      dilation=1)
+        self.location_dense = LinearNorm(attention_n_filters, attention_dim,
+                                         bias=False, w_init_gain='tanh')
+
+    def forward(self, attention_weights_cat):
+        processed_attention = self.location_conv(attention_weights_cat)
+        processed_attention = processed_attention.transpose(1, 2)
+        processed_attention = self.location_dense(processed_attention)
+        return processed_attention
+
+
+class Prenet(nn.Module):
+    def __init__(self, in_dim, sizes):
+        super(Prenet, self).__init__()
+        in_sizes = [in_dim] + sizes[:-1]
+        self.layers = nn.ModuleList(
+            [LinearNorm(in_size, out_size, bias=False)
+             for (in_size, out_size) in zip(in_sizes, sizes)])
+
+    def forward(self, x):
+        for linear in self.layers:
+            x = F.dropout(F.relu(linear(x)), p=0.5, training=True)
+        return x
+
+
+class Attention(nn.Module):
+    def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
+                 attention_location_n_filters, attention_location_kernel_size):
+        # attention_rnn_dim: 1024, embedding_dim: dim_neck * 2, attention_dim:128 ,
+        # attention_location_n_filters:32 , attention_location_kernel_size:31
+        super(Attention, self).__init__()
+        self.query_layer = LinearNorm(attention_rnn_dim, attention_dim,
+                                      bias=False, w_init_gain='tanh')
+        self.memory_layer = LinearNorm(embedding_dim, attention_dim, bias=False,
+                                       w_init_gain='tanh')
+        # memory_layer : input 16 or 7 or 64, output 128
+
+        self.v = LinearNorm(attention_dim, 1, bias=False)
+        # v : 128, 1
+        self.location_layer = LocationLayer(attention_location_n_filters,
+                                            attention_location_kernel_size,
+                                            attention_dim)
+        self.score_mask_value = -float("inf")
+
+    def get_alignment_energies(self, query, processed_memory,
+                               attention_weights_cat):
+        """
+        PARAMS
+        ------
+        query: decoder output (batch, n_mel_channels * n_frames_per_step)
+        processed_memory: processed encoder outputs (B, T_in, attention_dim)
+        attention_weights_cat: cumulative and prev. att weights (B, 2, max_time)
+
+        RETURNS
+        -------
+        alignment (batch, max_time)
+        """
+
+        processed_query = self.query_layer(query.unsqueeze(1))  # (B, 1, 80)
+        processed_attention_weights = self.location_layer(attention_weights_cat)  # (B, )
+        energies = self.v(torch.tanh(
+            processed_query + processed_attention_weights + processed_memory))  # (B, T, 128)
+
+        energies = energies.squeeze(-1)  # (B, max_time, 1)?
+        return energies  # (B, max_time)
+
+    def forward(self, attention_hidden_state, memory, processed_memory,
+                attention_weights_cat, mask):
+        """
+        PARAMS
+        ------
+        attention_hidden_state: attention rnn last output
+        memory: encoder outputs
+        processed_memory: processed encoder outputs
+        attention_weights_cat: previous and cummulative attention weights
+        mask: binary mask for padded data
+        """
+        alignment = self.get_alignment_energies(
+            attention_hidden_state, processed_memory, attention_weights_cat)
+        # mask = mask.unsqueeze(-1)
+        if mask is not None:
+            alignment.data.masked_fill_(mask, self.score_mask_value)
+        # alignment、mask不能广播
+        # alignment : (B, max_time), mask : (B, 47)
+        # TODO : 不能广播？
+
+        attention_weights = F.softmax(alignment, dim=1)
+        attention_context = torch.bmm(attention_weights.unsqueeze(1), memory)
+        attention_context = attention_context.squeeze(1)
+
+        return attention_context, attention_weights
+
 
 class LinearNorm(torch.nn.Module):
     def __init__(self, in_dim, out_dim, bias=True, w_init_gain='linear'):
+        # 128, 1
         super(LinearNorm, self).__init__()
         self.linear_layer = torch.nn.Linear(in_dim, out_dim, bias=bias)
+        # (1024, 128)
+        # (16, 128) or (7, 128) or (64, 128)
+        # (128, 1)
 
         torch.nn.init.xavier_uniform_(
             self.linear_layer.weight,
@@ -22,7 +128,6 @@ class LinearNorm(torch.nn.Module):
         return self.linear_layer(x)
 
 
-    
 class ConvNorm(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=1, stride=1,
                  padding=None, dilation=1, bias=True, w_init_gain='linear'):
@@ -100,8 +205,7 @@ class Encoder_t(nn.Module):
 
         return codes        
     
-    
-    
+
 class Encoder_6(nn.Module):
     """F0 encoder
     """
@@ -151,8 +255,7 @@ class Encoder_6(nn.Module):
 
         return codes 
     
-    
-    
+
 class Encoder_7(nn.Module):
     """Sync Encoder module
     """
@@ -285,7 +388,401 @@ class Decoder_3(nn.Module):
         decoder_output = self.linear_projection(outputs)
 
         return decoder_output          
-    
+
+
+class Decoder_att(nn.Module):
+    def __init__(self, hparams):
+        super(Decoder_att, self).__init__()
+        # self.n_mel_channels = hparams.n_mel_channels
+        self.n_mel_channels = hparams.dim_freq
+        self.n_frames_per_step = hparams.n_frames_per_step
+        self.encoder_embedding_dim_1 = hparams.dim_neck * 2
+        self.encoder_embedding_dim_2 = hparams.enc_mbv_size
+        self.encoder_embedding_dim_3 = hparams.dim_neck_3 * 2
+        self.attention_rnn_dim = hparams.attention_rnn_dim
+        self.decoder_rnn_dim = hparams.decoder_rnn_dim
+        self.prenet_dim = hparams.prenet_dim
+        self.max_decoder_steps = hparams.max_decoder_steps
+        self.gate_threshold = hparams.gate_threshold
+        self.p_attention_dropout = hparams.p_attention_dropout
+        self.p_decoder_dropout = hparams.p_decoder_dropout
+
+        self.prenet = Prenet(
+            hparams.n_mel_channels * hparams.n_frames_per_step,
+            [hparams.prenet_dim, hparams.prenet_dim])
+
+        self.attention_rnn = nn.LSTMCell(
+            hparams.prenet_dim + hparams.dim_neck * 2 + hparams.enc_mbv_size + hparams.dim_neck_3 * 2,
+            hparams.attention_rnn_dim)
+        # inputs + context vector 1, 2, 3
+        # 256+ 8*2 + 7 + 32*2=343
+
+        # 复制3次
+        # content
+        self.attention_layer_1 = Attention(
+            hparams.attention_rnn_dim, hparams.dim_neck * 2,
+            hparams.attention_dim, hparams.attention_location_n_filters,
+            hparams.attention_location_kernel_size)
+        # 复制3次
+        # rhythm
+        # self.attention_rnn_2 = nn.LSTMCell(
+        #     hparams.prenet_dim + hparams.enc_mbv_size,
+        #     hparams.attention_rnn_dim)
+        self.attention_layer_2 = Attention(
+            hparams.attention_rnn_dim, hparams.enc_mbv_size,
+            hparams.attention_dim, hparams.attention_location_n_filters,
+            hparams.attention_location_kernel_size)
+        # 复制3次
+        # pitch
+        # self.attention_rnn_3 = nn.LSTMCell(
+        #     hparams.prenet_dim + hparams.dim_neck_3 * 2,
+        #     hparams.attention_rnn_dim)
+        self.attention_layer_3 = Attention(
+            hparams.attention_rnn_dim, hparams.dim_neck_3 * 2,
+            hparams.attention_dim, hparams.attention_location_n_filters,
+            hparams.attention_location_kernel_size)
+
+        # content + rhythm + pitch + spk emb
+        self.decoder_rnn = nn.LSTMCell(
+            hparams.attention_rnn_dim + hparams.dim_neck * 2 + hparams.enc_mbv_size + hparams.dim_neck_3 * 2 + hparams.embedding_spk,
+            hparams.decoder_rnn_dim, 1)
+
+        self.linear_projection = LinearNorm(
+            hparams.decoder_rnn_dim + hparams.dim_neck * 2 + hparams.enc_mbv_size + hparams.dim_neck_3 * 2 + hparams.embedding_spk,
+            hparams.n_mel_channels * hparams.n_frames_per_step)
+
+        self.gate_layer = LinearNorm(
+            hparams.decoder_rnn_dim + hparams.dim_neck * 2 + hparams.enc_mbv_size + hparams.dim_neck_3 * 2, 1,
+            bias=True, w_init_gain='sigmoid')
+
+    def get_go_frame(self, memory):
+        """ Gets all zeros frames to use as first decoder input
+        PARAMS
+        ------
+        memory: decoder outputs
+
+        RETURNS
+        -------
+        decoder_input: all zeros frames
+        """
+        B = memory.size(0)
+        decoder_input = Variable(memory.data.new(
+            B, self.n_mel_channels * self.n_frames_per_step).zero_())
+        return decoder_input
+
+    def initialize_decoder_states(self, memory_1, mask_1, memory_2, mask_2, memory_3, mask_3):
+        """ Initializes attention rnn states, decoder rnn states, attention
+        weights, attention cumulative weights, attention context, stores memory
+        and stores processed memory
+        PARAMS
+        ------
+        memory: Encoder outputs
+        mask: Mask for padded data if training, expects None for inference
+        """
+        memory = torch.cat((memory_1, memory_2, memory_3), -1)
+        B = memory.size(0)
+        MAX_TIME = max(memory_1.size(1), memory_2.size(1), memory_3.size(1))
+
+        self.attention_hidden = Variable(memory.data.new(
+            B, self.attention_rnn_dim).zero_())
+        self.attention_cell = Variable(memory.data.new(
+            B, self.attention_rnn_dim).zero_())
+
+        self.decoder_hidden = Variable(memory.data.new(
+            B, self.decoder_rnn_dim).zero_())
+        self.decoder_cell = Variable(memory.data.new(
+            B, self.decoder_rnn_dim).zero_())
+
+        # set attention layer parameters
+        self.attention_weights_1 = Variable(memory_1.data.new(
+            B, MAX_TIME).zero_())
+        self.attention_weights_cum_1 = Variable(memory_1.data.new(
+            B, MAX_TIME).zero_())
+        self.attention_context_1 = Variable(memory_1.data.new(
+            B, self.encoder_embedding_dim_1).zero_())
+
+        self.attention_weights_2 = Variable(memory_2.data.new(
+            B, MAX_TIME).zero_())
+        self.attention_weights_cum_2 = Variable(memory_2.data.new(
+            B, MAX_TIME).zero_())
+        self.attention_context_2 = Variable(memory_2.data.new(
+            B, self.encoder_embedding_dim_2).zero_())
+
+        self.attention_weights_3 = Variable(memory_3.data.new(
+            B, MAX_TIME).zero_())
+        self.attention_weights_cum_3 = Variable(memory_3.data.new(
+            B, MAX_TIME).zero_())
+        self.attention_context_3 = Variable(memory_3.data.new(
+            B, self.encoder_embedding_dim_3).zero_())
+
+        self.memory_1 = memory_1
+        self.processed_memory_1 = self.attention_layer_1.memory_layer(memory_1)
+        self.mask_1 = mask_1
+        self.memory_2 = memory_2
+        self.processed_memory_2 = self.attention_layer_2.memory_layer(memory_2)
+        self.mask_2 = mask_2
+        self.memory_3 = memory_3
+        self.processed_memory_3 = self.attention_layer_3.memory_layer(memory_3)
+        self.mask_3 = mask_3
+
+    def parse_decoder_inputs(self, decoder_inputs):
+        """ Prepares decoder inputs, i.e. mel outputs
+        PARAMS
+        ------
+        decoder_inputs: inputs used for teacher-forced training, i.e. mel-specs
+
+        RETURNS
+        -------
+        inputs: processed decoder inputs
+
+        """
+        # (B, n_mel_channels, T_out) -> (B, T_out, n_mel_channels)
+        decoder_inputs = decoder_inputs.transpose(1, 2)
+        decoder_inputs = decoder_inputs.view(
+            decoder_inputs.size(0),
+            int(decoder_inputs.size(1) / self.n_frames_per_step), -1)
+        # (B, T_out, n_mel_channels) -> (T_out, B, n_mel_channels)
+        decoder_inputs = decoder_inputs.transpose(0, 1)
+        return decoder_inputs
+
+    def parse_decoder_outputs(self, mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3):
+        """ Prepares decoder outputs for output
+        PARAMS
+        ------
+        mel_outputs:
+        gate_outputs: gate output energies
+        alignments:
+
+        RETURNS
+        -------
+        mel_outputs:
+        gate_outpust: gate output energies
+        alignments:
+        """
+        # (T_out, B) -> (B, T_out)
+        alignments_1 = torch.stack(alignments_1).transpose(0, 1)
+        alignments_2 = torch.stack(alignments_2).transpose(0, 1)
+        alignments_3 = torch.stack(alignments_3).transpose(0, 1)
+        # (T_out, B) -> (B, T_out)
+        gate_outputs = torch.stack(gate_outputs).transpose(0, 1)
+        gate_outputs = gate_outputs.contiguous()
+        # (T_out, B, n_mel_channels) -> (B, T_out, n_mel_channels)
+        mel_outputs = torch.stack(mel_outputs).transpose(0, 1).contiguous()
+        # decouple frames per step
+        mel_outputs = mel_outputs.view(
+            mel_outputs.size(0), -1, self.n_mel_channels)
+        # (B, T_out, n_mel_channels) -> (B, n_mel_channels, T_out)
+        mel_outputs = mel_outputs.transpose(1, 2)
+
+        return mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3
+
+    def decode(self, decoder_input, spk):
+        """ Decoder step using stored states, attention and memory
+        PARAMS
+        ------
+        decoder_input: previous mel output
+        # 80维
+
+        RETURNS
+        -------
+        mel_output:
+        gate_output: gate output energies
+        attention_weights:
+        """
+        # spk : (64, 16, 408)
+        cell_input = torch.cat((decoder_input, self.attention_context_1, self.attention_context_2, self.attention_context_3), -1)
+        # 应该为343
+        # print(decoder_input.shape)
+        # print(self.attention_context_1.shape)
+        # print(self.attention_context_2.shape)
+        # print(self.attention_context_3.shape)
+        # print(cell_input.shape)
+        # torch.Size([16, 256])
+        # torch.Size([16, 16])
+        # torch.Size([16, 7])
+        # torch.Size([16, 64])
+        # torch.Size([16, 343])
+        self.attention_hidden, self.attention_cell = self.attention_rnn(
+            cell_input, (self.attention_hidden, self.attention_cell))
+        self.attention_hidden = F.dropout(
+            self.attention_hidden, self.p_attention_dropout, self.training)
+
+        attention_weights_cat_1 = torch.cat(
+            (self.attention_weights_1.unsqueeze(1),
+             self.attention_weights_cum_1.unsqueeze(1)), dim=1)
+        attention_weights_cat_2 = torch.cat(
+            (self.attention_weights_2.unsqueeze(1),
+             self.attention_weights_cum_2.unsqueeze(1)), dim=1)
+        attention_weights_cat_3 = torch.cat(
+            (self.attention_weights_3.unsqueeze(1),
+             self.attention_weights_cum_3.unsqueeze(1)), dim=1)
+
+        # 三次复制  3种attention attention_hidden不变 ，memory processed_memory要改变
+        # print(self.attention_hidden.shape)
+        # torch.Size([16, 1024])
+
+        # print(self.memory_1.shape)
+        # print(self.processed_memory_1.shape)
+        # print(attention_weights_cat_1.shape)
+        # print(self.mask_1.shape)
+
+        # torch.Size([16, 408, 16])
+        # torch.Size([16, 408, 128])
+        # torch.Size([16, 2, 408])
+        # torch.Size([16, 408])
+
+
+
+        # print(self.memory_2.shape)
+        # print(self.processed_memory_2.shape)
+        # print(attention_weights_cat_2.shape)
+        # print(self.mask_2.shape)
+        # torch.Size([16, 408, 7])
+        # torch.Size([16, 408, 128])
+        # torch.Size([16, 2, 408])
+        # torch.Size([16, 408])
+
+        # print(self.memory_3.shape)
+        # print(self.processed_memory_3.shape)
+        # print(attention_weights_cat_3.shape)
+        # print(self.mask_3.shape)
+        # torch.Size([16, 408, 64])
+        # torch.Size([16, 408, 128])
+        # torch.Size([16, 2, 408])
+        # torch.Size([16, 408])
+
+        self.attention_context_1, self.attention_weights_1 = self.attention_layer_1(
+            self.attention_hidden, self.memory_1, self.processed_memory_1,
+            attention_weights_cat_1, self.mask_1)
+
+        self.attention_context_2, self.attention_weights_2 = self.attention_layer_2(
+            self.attention_hidden, self.memory_2, self.processed_memory_2,
+            attention_weights_cat_2, self.mask_2)
+
+        self.attention_context_3, self.attention_weights_3 = self.attention_layer_3(
+            self.attention_hidden, self.memory_3, self.processed_memory_3,
+            attention_weights_cat_3, self.mask_3)
+
+        self.attention_weights_cum_1 += self.attention_weights_1
+        self.attention_weights_cum_2 += self.attention_weights_1
+        self.attention_weights_cum_3 += self.attention_weights_1
+        decoder_input = torch.cat(
+            (self.attention_hidden, self.attention_context_1, self.attention_context_2, self.attention_context_3, spk), -1)
+        # (16, 1024 ),  torch.Size([16, 16]), torch.Size([16, 7]), torch.Size([16, 64]),
+        self.decoder_hidden, self.decoder_cell = self.decoder_rnn(
+            decoder_input, (self.decoder_hidden, self.decoder_cell))
+        self.decoder_hidden = F.dropout(
+            self.decoder_hidden, self.p_decoder_dropout, self.training)
+        # decoder hidden共享 attention_context1 attention_context2
+        decoder_hidden_attention_context = torch.cat(
+            (self.decoder_hidden, self.attention_context_1, self.attention_context_2, self.attention_context_3), dim=1)
+        decoder_hidden_attention_context_plus_spk = torch.cat((decoder_hidden_attention_context, spk), dim=-1)
+
+        decoder_output = self.linear_projection(
+            decoder_hidden_attention_context_plus_spk)
+
+        gate_prediction = self.gate_layer(decoder_hidden_attention_context)
+        return decoder_output, gate_prediction, self.attention_weights_1, self.attention_weights_2, self.attention_weights_3
+
+    def forward(self, decoder_inputs, memory_1, memory_lengths_1, memory_2, memory_lengths_2, memory_3, memory_lengths_3, spk):
+        """ Decoder forward pass for training
+        PARAMS
+        ------
+        memory: Encoder outputs
+        decoder_inputs: Decoder inputs for teacher forcing. i.e. mel-specs
+        memory_lengths: Encoder output lengths for attention masking.
+
+        RETURNS
+        -------
+        mel_outputs: mel outputs from the decoder
+        gate_outputs: gate outputs from the decoder
+        alignments: sequence of attention weights from the decoder
+        """
+        # memory = torch.cat((memory_1, memory_2, memory_3), 1)
+        memory = torch.cat((memory_1, memory_2, memory_3), -1)
+        decoder_input = self.get_go_frame(memory).unsqueeze(0)
+        # print(decoder_input.shape)
+        # decoder_input: (1, 16, 80)
+
+        # parse:(B, n_mel_channels, T_out) -> (T_out, B, n_mel_channels)
+        decoder_inputs = self.parse_decoder_inputs(decoder_inputs)
+        # print(decoder_inputs.shape)
+        # decoder_inputs: (80, 16, 408)
+        decoder_inputs = decoder_inputs.transpose(0, 2)
+
+        decoder_inputs = torch.cat((decoder_input, decoder_inputs), dim=0)
+        decoder_inputs = self.prenet(decoder_inputs)
+
+        # spk : (16, 408, 64) -> (16, 64, 408)-> (64, 16, 408)
+        # spk = spk.transpose(1, 2)
+        # spk = spk.transpose(0, 1)
+
+        self.initialize_decoder_states(
+            memory_1=memory_1, mask_1=~get_mask_from_lengths_taco(memory_lengths_1),
+            memory_2=memory_2, mask_2=~get_mask_from_lengths_taco(memory_lengths_2),
+            memory_3=memory_3, mask_3=~get_mask_from_lengths_taco(memory_lengths_3))
+
+        mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3 = [], [], [], [], []
+        while len(mel_outputs) < decoder_inputs.size(0) - 1:
+            decoder_input = decoder_inputs[len(mel_outputs)]
+            mel_output, gate_output, attention_weights_1, attention_weights_2, attention_weights_3 = self.decode(
+                decoder_input, spk)
+            mel_outputs += [mel_output.squeeze(1)]
+            gate_outputs += [gate_output.squeeze(1)]
+            alignments_1 += [attention_weights_1]
+            alignments_2 += [attention_weights_2]
+            alignments_3 += [attention_weights_3]
+
+        mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3 = self.parse_decoder_outputs(
+            mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3)
+
+        return mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3
+
+    def inference(self, memory_1, memory_2, memory_3, spk):
+        """ Decoder inference
+        PARAMS
+        ------
+        memory: Encoder outputs
+
+        RETURNS
+        -------
+        mel_outputs: mel outputs from the decoder
+        gate_outputs: gate outputs from the decoder
+        alignments: sequence of attention weights from the decoder
+        """
+        memory = torch.cat((memory_1, memory_2, memory_3), -1)
+        decoder_input = self.get_go_frame(memory)
+
+        self.initialize_decoder_states(
+            memory_1=memory_1, mask_1=None,
+            memory_2=memory_2, mask_2=None,
+            memory_3=memory_3, mask_3=None)
+
+        mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3 = [], [], [], [], []
+        while True:
+            decoder_input = self.prenet(decoder_input)
+            mel_output, gate_output, attention_weights_1, attention_weights_2, attention_weights_3 = self.decode(decoder_input, spk)
+
+            mel_outputs += [mel_output.squeeze(1)]
+            gate_outputs += [gate_output]
+            alignments_1 += [attention_weights_1]
+            alignments_2 += [attention_weights_2]
+            alignments_3 += [attention_weights_3]
+
+            if torch.sigmoid(gate_output.data) > self.gate_threshold:
+                break
+            elif len(mel_outputs) == self.max_decoder_steps:
+                print("Warning! Reached max decoder steps")
+                break
+
+            decoder_input = mel_output
+
+        mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3 = self.parse_decoder_outputs(
+            mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3)
+
+        return mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3
+
+
 
 class Decoder_4(nn.Module):
     """For F0 converter
@@ -560,15 +1057,6 @@ class GRL(nn.Module):
         return ReverseLayerF.apply(input, alpha)
 
 
-# def gradient_rever(x, alpha):
-#     return ReverseLayerF()(x, alpha)
-
-# class GradReverse(Function):
-#     def forward(self, x):
-#         return x.view_as(x)
-#
-#     def backward(self, grad_output):
-#         return (grad_output * -lambd)
 class Mask_Softmax(nn.Module):
     def __init__(self, plus=1.0):
         super(Mask_Softmax, self).__init__()
@@ -655,8 +1143,7 @@ class Parrot(nn.Module):
         # self.mask_one_hot[4, :] = 0
         # 得到一组[3, dim_content + dim_rhythm + dim_pitch]的矩阵
         self.mask_p = torch.cat((self.mask_content, self.mask_rhythm, self.mask_pitch,self.mask_one_hot), dim=1)
-        
-        
+
         self.mask_part = self.mask_p.repeat(hparams.max_len_pad//4 + 1, 1)[:hparams.max_len_pad,:]#padding to (408,c+r+f+e)
 
         #MBV拆开计算loss
@@ -666,10 +1153,6 @@ class Parrot(nn.Module):
         self.mask_R = self.mask_rhythm
         self.mask_R = self.mask_R.repeat(hparams.max_len_pad//4 + 1, 1)[:hparams.max_len_pad,:]
         self.invert_mask_R = (self.mask_R== 0).long()
-
-
-
-        
         #self.mask_par = self.mask_pa.repeat(hparams.batch_size // 3, 1)
        
         # 1：predicted
@@ -679,7 +1162,8 @@ class Parrot(nn.Module):
         self.encoder_1 = Encoder_7(hparams)
         self.encoder_2 = Encoder_t(hparams)
         # encoder_2 : rhythm encoder
-        self.decoder = Decoder_3(hparams)
+        # self.decoder = Decoder_3(hparams)
+        self.decoder = Decoder_att(hparams)
         self.GRL = GRL(alpha=1)
 
         #self.ortho = TransformerSpecPredictionHead(hparams, self.dim_neck*2+self.dim_neck_2*2+self.dim_neck_3*2+hparams.embedding_spk, self.device)
@@ -705,7 +1189,7 @@ class Parrot(nn.Module):
         # parameters_orthogonal
         return params_G, params_ortho
 
-    def forward(self, x_f0, x_org, c_trg):
+    def forward(self, x_f0, x_org, c_trg, content_length, rhythm_length, pitch_length):
         # print(c_trg.shape)
 
         # [16,20]16是bacth size
@@ -738,49 +1222,17 @@ class Parrot(nn.Module):
         #[16, 20]
         # aa = c_trg.unsqueeze(-1)
         bb = c_trg.cpu().numpy().tolist()
-        # print(bb)
-        # print(bb.size)
-        # sp_query = torch.LongTensor()
-        # sp_query = [ b.index(1) for b in bb]
         sp_query = []
-        # for b in bb:
-        #     try :
-        #         sp_query.append(b.index(1))
-        #     except ValueError as e:
-        #         sp_query.append(0)
+
         for b in bb:
             if 1.0 in b:
                 sp_query.append(b.index(1))
             else:
                 sp_query.append(0)
-        # print(sp_query)
-        # print(c_trg.shape)
-        # # c_trg = [1,20]
-        # # sp_query = (c_trg==1).long()
-        # # sp_query = np.where(c_trg==1)
-        # aa = c_trg.cpu().numpy().tolist()
-        # # print(aa)
-        # sp_query = aa.index(1.0)
-        # print(sp_query.shape)
-        
-        # sp_query.to(torch.Tensor)
-
-
-        # sp_query = torch.Tensor(sp_query).unsqueeze(1).unsqueeze(1)
-        # print(sp_query.shape)
-
-        # speaker_embedding = [self.embedding(input=a) for a in sp_query]
         #[16, 16]
         # speaker_embedding = [self.embedding(input=sp) for sp in sp_query]
         speaker_embedding = self.embedding(torch.LongTensor(sp_query).to(self.device))
-        #[16, 16]
-        # print(speaker_embedding.shape)
-        # speaker_embedding = [self.embedding(sp) for sp in sp_query]
-
-        # speaker_embedding = [self.embedding(sp) for sp in sp_query]
-        # # speaker_embedding [1, 16]
-        # tt = speaker_embedding.unsqueeze(1).expand(-1, x_1.size(-1), -1)
-        # print(tt.shape)
+        #[16, 64]
 
 
         encoder_outputs = torch.cat((code_exp_1, code_exp_2, code_exp_3,
@@ -812,10 +1264,27 @@ class Parrot(nn.Module):
         # 模型会预测所有feature，但是我们希望只有mask掉的特征的loss对梯度进行更新，所有对于没有mask的将ground truth copy过去，这个结果就是第1项
         # loss_ortho = self.loss((feature_predict.to(self.device) * self.invert_mask.to(self.device)).clone() + ortho_inputs_integral.to(self.device) * self.mask_part.to(self.device), ortho_inputs_integral.to(self.device))
         # c_trg : timbre
-        mel_outputs = self.decoder(encoder_outputs)
+        # mel_outputs = self.decoder(encoder_outputs)
+        code_exp_1_mm = code_exp_1.transpose(1, 2)
+        code_exp_2_mm = code_exp_2.transpose(1, 2)
+        code_exp_3_mm = code_exp_3.transpose(1, 2)
+        # (16, 408, 16), (16, 408, 7), (16, 408, 64) -> (16, 16, 408), (16, 7, 408), (16, 64, 408)
+        # mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3 = \
+        #     self.decoder(x_org, memory_1=code_exp_1_mm,  memory_lengths_1=content_length,
+        #                  memory_2=code_exp_2_mm, memory_lengths_2=rhythm_length,
+        #                  memory_3=code_exp_3_mm, memory_lengths_3=pitch_length,
+        #                  spk=speaker_embedding.unsqueeze(1).expand(-1, x_1.size(-1), -1))
+        # # spk : (16, 1, 64) -> (16, 408, 64)
 
-        
-        #将Rhythm分开计算BCE loss。
+        # (16, 408, 16), (16, 408, 7), (16, 408, 64)
+        mel_outputs, gate_outputs, alignments_1, alignments_2, alignments_3 = \
+            self.decoder(x_org, memory_1=code_exp_1,  memory_lengths_1=content_length,
+                         memory_2=code_exp_2, memory_lengths_2=rhythm_length,
+                         memory_3=code_exp_3, memory_lengths_3=pitch_length,
+                         spk=speaker_embedding)
+        # (16, 1, 64) -> (16, 408, 64)
+
+        # 将Rhythm分开计算BCE loss。
 
         feature_predict_C_P_U = torch.cat((feature_predict[:,:,:self.dim_neck*2],feature_predict[:,:,self.dim_neck*2+hparams.enc_mbv_size:]),dim=-1)
         mask_part_C_P_U = self.mask_C_P_U

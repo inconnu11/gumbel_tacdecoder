@@ -1282,6 +1282,7 @@ class Parrot(nn.Module):
                          memory_2=code_exp_2, memory_lengths_2=rhythm_length,
                          memory_3=code_exp_3, memory_lengths_3=pitch_length,
                          spk=speaker_embedding)
+        mel_outputs = mel_outputs.transpose(1, 2)
         # (16, 1, 64) -> (16, 408, 64)
 
         # 将Rhythm分开计算BCE loss。

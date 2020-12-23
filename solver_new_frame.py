@@ -13,6 +13,7 @@ import datetime
 import pickle
 import math
 
+from taco2.logger import Tacotron2Logger
 from utils import pad_seq_to_2, quantize_f0_torch, quantize_f0_numpy
 
 # use demo data for simplicity
@@ -60,6 +61,7 @@ class Solver(object):
         self.log_dir = config.log_dir
         self.sample_dir = config.sample_dir
         self.model_save_dir = config.model_save_dir
+        self.output_dir = '/workspace/cpfs-data/gumbel_tacdecoder/taco2_output'
 
         # Step size.
         self.log_step = config.log_step
@@ -73,6 +75,16 @@ class Solver(object):
 
         # torch.autograd.set_detect_anomaly(True)
 
+    def prepare_directories_and_logger(self, output_directory, log_directory, rank):
+        if rank == 0:
+            if not os.path.isdir(output_directory):
+                os.makedirs(output_directory)
+                os.chmod(output_directory, 0o775)
+            logger = Tacotron2Logger(os.path.join(output_directory, log_directory))
+        else:
+            logger = None
+        return logger
+
     def build_model(self, config):
         # 定义模型
         self.model = Parrot(self.hparams, config)
@@ -80,7 +92,8 @@ class Solver(object):
         # self.ortho = OrthoDisen(self.hparams)
         self.Interp = InterpLnr(self.hparams)
         #self.pre_r_encoder_path = '/datapool/home/zxt20/JieWang2021ICME/Baselines/pretrained/660000-G.ckpt'
-        self.pre_r_encoder_path = '/workspace/cpfs-data/gumbel_softmax_Embedding/pretrained/660000-G.ckpt'
+        self.pre_r_encoder_path = '/workspace/cpfs-data/pretrained/660000-G.ckpt'
+        self.logger = self.prepare_directories_and_logger(self.output_dir, self.log_dir, 0)
         # self.parameters_main = self.model.grouped_parameters()
         # 定义2个优化器optimizer
         # self.optimizer_ortho = torch.optim.Adam(self.parameters_orth, self.lr_ortho, [self.beta1_ortho, self.beta2_ortho])
@@ -232,7 +245,7 @@ class Solver(object):
             decay_steps = 12500
             ''''''
             # w_decay = w_ini * decay_rate ^ (i / decay_steps)
-            w_decay = w_ini * math.pow(decay_rate , i / decay_steps)
+            w_decay = w_ini * math.pow(decay_rate , (i+1) / decay_steps)
 
             loss_overall_id = self.w_main * w_decay * loss_main + self.w_ortho * loss_ortho
             loss_overall = loss_overall_id / (self.w_main * w_ini)
@@ -320,18 +333,9 @@ class Solver(object):
                             x_real_pad = torch.from_numpy(x_real_pad).to(self.device)
                             x_f0 = torch.cat((x_real_pad, f0_org_val), dim=-1)
 
-                            mel_outputs, feature_predicts, ortho_inputs_integrals, mask_parts, invert_masks = self.model(x_f0, x_real_pad, emb_org_val)
-                            
-
-                            
-                           
-
+                            mel_outputs, feature_predicts, ortho_inputs_integrals, mask_parts, invert_masks = self.model(x_f0, x_real_pad, emb_org_val, len_org, len_org, len_org)
                             loss_main_val = F.mse_loss(x_real_pad, mel_outputs, reduction='sum')
                             loss_frame_main_val = F.mse_loss(x_real_pad, mel_outputs, reduction='mean')
-
-
-                            
-                            
                             loss_ortho_id_L1_val = self.loss_o(ortho_inputs_integrals[0].cuda(),
                                                         feature_predicts[0].cuda() * invert_masks[0].cuda() + ortho_inputs_integrals[0].cuda() * mask_parts[0].cuda())
 
@@ -347,7 +351,7 @@ class Solver(object):
                             w_ini = 100
                             decay_rate = 0.999
                             decay_steps = 12500
-                            w_decay = w_ini * math.pow(decay_rate , i / decay_steps)
+                            w_decay = w_ini * math.pow(decay_rate, (i+1) / decay_steps)
                             
                             ''''''
                             loss_overall_id = self.w_main * w_decay * loss_main_val + self.w_ortho * loss_ortho_val
@@ -363,6 +367,8 @@ class Solver(object):
                 val_ortho_loss = np.mean(loss_ortho_val_list)
                 val_frame_main_loss = np.mean(loss_frame_main_val_list)
                 print('Validation overall loss : {}, main loss: {}, ortho loss: {}, frame_main_loss:{}'.format(val_overall_loss, val_main_loss, val_ortho_loss,val_frame_main_loss))
+
+                self.logger.log_validation(self.model, x_real_pad, mel_outputs, i + 1)
                 if self.use_tensorboard:
                     self.writer.add_scalar('Validation_overall_loss', val_overall_loss, i + 1)
                     self.writer.add_scalar('Validation_main_loss', val_main_loss, i + 1)
@@ -389,11 +395,11 @@ class Solver(object):
                             x_f0_F = torch.cat((x_real_pad, torch.zeros_like(f0_org_val)), dim=-1)
                             x_f0_C = torch.cat((torch.zeros_like(x_real_pad), f0_org_val), dim=-1)
 
-                            x_identic_val,_ , _, _, _ = self.model(x_f0, x_real_pad, emb_org_val)
-                            x_identic_woF,_ , _, _, _  = self.model(x_f0_F, x_real_pad, emb_org_val)
-                            x_identic_woR,_ , _, _, _  = self.model(x_f0, torch.zeros_like(x_real_pad), emb_org_val)
-                            x_identic_woC,_ , _, _, _  = self.model(x_f0_C, x_real_pad, emb_org_val)
-                            x_identic_woU,_ , _, _, _  = self.model(x_f0, x_real_pad, torch.zeros_like(emb_org_val))
+                            x_identic_val,_ , _, _, _ = self.model(x_f0, x_real_pad, emb_org_val, len_org, len_org, len_org)
+                            x_identic_woF,_ , _, _, _  = self.model(x_f0_F, x_real_pad, emb_org_val, len_org, len_org, len_org)
+                            x_identic_woR,_ , _, _, _  = self.model(x_f0, torch.zeros_like(x_real_pad), emb_org_val, len_org, len_org, len_org)
+                            x_identic_woC,_ , _, _, _  = self.model(x_f0_C, x_real_pad, emb_org_val, len_org, len_org, len_org)
+                            x_identic_woU,_ , _, _, _  = self.model(x_f0, x_real_pad, torch.zeros_like(emb_org_val), len_org, len_org, len_org)
 
                             melsp_gd_pad = x_real_pad[0].cpu().numpy().T
                             # ground truth

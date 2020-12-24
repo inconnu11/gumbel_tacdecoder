@@ -108,7 +108,7 @@ class MyCollator(object):
             
                 
             try:
-                left = np.random.randint(0, len(aa)-len_crop, size=2)
+                left = np.random.randint(0, len(aa)-len_crop[0], size=2)
             except ValueError as e:
                 left=np.random.randint(0, 1, size=2)
             

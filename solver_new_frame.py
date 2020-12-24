@@ -91,14 +91,14 @@ class Solver(object):
         # self.G = Generator(self.hparams)
         # self.ortho = OrthoDisen(self.hparams)
         self.Interp = InterpLnr(self.hparams)
-        #self.pre_r_encoder_path = '/datapool/home/zxt20/JieWang2021ICME/Baselines/pretrained/660000-G.ckpt'
+        # self.pre_r_encoder_path = '/datapool/home/zxt20/JieWang2021ICME/Baselines/pretrained/660000-G.ckpt'
         self.pre_r_encoder_path = '/workspace/cpfs-data/pretrained/660000-G.ckpt'
         self.logger = self.prepare_directories_and_logger(self.output_dir, self.log_dir, 0)
         # self.parameters_main = self.model.grouped_parameters()
         # 定义2个优化器optimizer
         # self.optimizer_ortho = torch.optim.Adam(self.parameters_orth, self.lr_ortho, [self.beta1_ortho, self.beta2_ortho])
-        self.model ,self.frozen_state_dict= get_Rhythm_Encoder_parameters(self.pre_r_encoder_path,self.model)
-        
+        self.model, self.frozen_state_dict = get_Rhythm_Encoder_parameters(self.pre_r_encoder_path, self.model)
+
         # self.parameters_main = self.model.grouped_parameters()
         # 定义2个优化器optimizer
         # self.optimizer_ortho = torch.optim.Adam(self.parameters_orth, self.lr_ortho, [self.beta1_ortho, self.beta2_ortho])
@@ -123,18 +123,18 @@ class Solver(object):
             # 统计模型的参数量
             num_params += p.numel()
             # p.numel 返回元素的数量
-        print(model)
+        print(model, flush=True)
         # 把encoder、decoder以及各自的结构输出
-        print(name)
+        print(name, flush=True)
         # 输出网络名称 G
-        print("The number of parameters: {}".format(num_params))
+        print("The number of parameters: {}".format(num_params), flush=True)
 
     def print_optimizer(self, opt, name):
-        print(opt)
-        print(name)
+        print(opt, flush=True)
+        print(name, flush=True)
 
     def restore_model(self, resume_iters):
-        print('Loading the trained models from step {}...'.format(resume_iters))
+        print('Loading the trained models from step {}...'.format(resume_iters), flush=True)
         # G_path = os.path.join(self.model_save_dir, '{}.ckpt'.format(resume_iters))
         ckpt_path = os.path.join(self.model_save_dir, '{}.ckpt'.format(resume_iters))
         checkpoint_dict = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
@@ -167,7 +167,7 @@ class Solver(object):
         # Start training from scratch or resume training.
         start_iters = 0
         if self.resume_iters:
-            print('Resuming ...')
+            print('Resuming ...', flush=True)
             start_iters = self.resume_iters
             self.num_iters += self.resume_iters
             self.restore_model(self.resume_iters)
@@ -178,7 +178,7 @@ class Solver(object):
 
         # Learning rate cache for decaying.
         lr_main = self.lr_main
-        print('Current learning rates, lr_g: {}.'.format(lr_main))
+        print('Current learning rates, lr_g: {}.'.format(lr_main), flush=True)
         # lr_ortho = self.lr_ortho
         # print('Current learning rates, lr_ortho: {}.'.format(lr_ortho))
 
@@ -186,7 +186,7 @@ class Solver(object):
         keys = ['overall/loss_id', 'main/loss_id', 'ortho/loss_id']
 
         # Start training.
-        print('Start training...')
+        print('Start training...', flush=True)
         start_time = time.time()
         for i in range(start_iters, self.num_iters):
 
@@ -224,18 +224,23 @@ class Solver(object):
             self.model = self.model.to(self.device)
 
             # x_identic = self.G(x_f0_intrp_org, x_real_org, emb_org)
-            mel_outputs, feature_predicts, ortho_inputs_integrals, mask_parts, invert_masks = self.model(x_f0_intrp_org, x_real_org, emb_org, len_org, len_org, len_org)
+            mel_outputs, feature_predicts, ortho_inputs_integrals, mask_parts, invert_masks, alignments = self.model(
+                x_f0_intrp_org, x_real_org, emb_org, len_org, len_org, len_org)
             loss_main_id = F.mse_loss(x_real_org, mel_outputs, reduction='mean')
 
             loss_ortho_id_L1 = self.loss_o(ortho_inputs_integrals[0].cuda(),
-                                        feature_predicts[0].cuda() * invert_masks[0].cuda() + ortho_inputs_integrals[0].cuda() * mask_parts[0].cuda())
+                                           feature_predicts[0].cuda() * invert_masks[0].cuda() + ortho_inputs_integrals[
+                                               0].cuda() * mask_parts[0].cuda())
 
-            temp = feature_predicts[1].cuda() * invert_masks[1].cuda() + ortho_inputs_integrals[1].cuda() * mask_parts[1].cuda()
-            loss_ortho_id_BCE = self.loss_BCE(feature_predicts[1].cuda() * invert_masks[1].cuda() + ortho_inputs_integrals[1].cuda() * mask_parts[1].cuda(),
-                                        ortho_inputs_integrals[1].cuda())
+            temp = feature_predicts[1].cuda() * invert_masks[1].cuda() + ortho_inputs_integrals[1].cuda() * mask_parts[
+                1].cuda()
+            loss_ortho_id_BCE = self.loss_BCE(
+                feature_predicts[1].cuda() * invert_masks[1].cuda() + ortho_inputs_integrals[1].cuda() * mask_parts[
+                    1].cuda(),
+                ortho_inputs_integrals[1].cuda())
 
             loss_main = loss_main_id
-            loss_ortho_id = loss_ortho_id_L1+loss_ortho_id_BCE
+            loss_ortho_id = loss_ortho_id_L1 + loss_ortho_id_BCE
 
             loss_ortho = loss_ortho_id
 
@@ -245,7 +250,7 @@ class Solver(object):
             decay_steps = 12500
             ''''''
             # w_decay = w_ini * decay_rate ^ (i / decay_steps)
-            w_decay = w_ini * math.pow(decay_rate , (i+1) / decay_steps)
+            w_decay = w_ini * math.pow(decay_rate, (i + 1) / decay_steps)
 
             loss_overall_id = self.w_main * w_decay * loss_main + self.w_ortho * loss_ortho
             loss_overall = loss_overall_id / (self.w_main * w_ini)
@@ -296,7 +301,7 @@ class Solver(object):
                 log = "Elapsed [{}], Iteration [{}/{}]".format(et, i + 1, self.num_iters)
                 for tag in keys:
                     log += ", {}: {:.8f}".format(tag, loss[tag])
-                print(log)
+                print(log, flush=True)
 
                 if self.use_tensorboard:
                     for tag, value in loss.items():
@@ -309,7 +314,7 @@ class Solver(object):
                 torch.save({'model': self.model.state_dict(),
                             'optimizer_main': self.optimizer_main.state_dict()}, model_path)
                 # 保存了 model + optimizer
-                print('Saved model checkpoints at iteration {} into {}...'.format(i, self.model_save_dir))
+                print('Saved model checkpoints at iteration {} into {}...'.format(i, self.model_save_dir), flush=True)
 
                 # Validation.
             if (i + 1) % self.sample_step == 0:
@@ -321,7 +326,7 @@ class Solver(object):
                     loss_ortho_val_list = []
                     for val_sub in validation_pt:
                         # validation_pt: load 进 demo.pkl
-                        emb_org_val = torch.from_numpy(val_sub[1][np.newaxis,:]).to(self.device)
+                        emb_org_val = torch.from_numpy(val_sub[1][np.newaxis, :]).to(self.device)
                         # spk的one hot embedding
                         for k in range(2, 3):
                             x_real_pad, _ = pad_seq_to_2(val_sub[k][0][np.newaxis, :, :], 408)
@@ -333,15 +338,19 @@ class Solver(object):
                             x_real_pad = torch.from_numpy(x_real_pad).to(self.device)
                             x_f0 = torch.cat((x_real_pad, f0_org_val), dim=-1)
 
-                            mel_outputs, feature_predicts, ortho_inputs_integrals, mask_parts, invert_masks = self.model(x_f0, x_real_pad, emb_org_val, len_org, len_org, len_org)
+                            mel_outputs, feature_predicts, ortho_inputs_integrals, mask_parts, invert_masks, alignments = self.model(
+                                x_f0, x_real_pad, emb_org_val, len_org, len_org, len_org)
                             loss_main_val = F.mse_loss(x_real_pad, mel_outputs, reduction='sum')
                             loss_frame_main_val = F.mse_loss(x_real_pad, mel_outputs, reduction='mean')
                             loss_ortho_id_L1_val = self.loss_o(ortho_inputs_integrals[0].cuda(),
-                                                        feature_predicts[0].cuda() * invert_masks[0].cuda() + ortho_inputs_integrals[0].cuda() * mask_parts[0].cuda())
+                                                               feature_predicts[0].cuda() * invert_masks[0].cuda() +
+                                                               ortho_inputs_integrals[0].cuda() * mask_parts[0].cuda())
 
-                            loss_ortho_id_BCE_val = self.loss_BCE(feature_predicts[1].cuda() * invert_masks[1].cuda() + ortho_inputs_integrals[1].cuda() * mask_parts[1].cuda()
-                                                    ,ortho_inputs_integrals[1].cuda())
-                                                    
+                            loss_ortho_id_BCE_val = self.loss_BCE(
+                                feature_predicts[1].cuda() * invert_masks[1].cuda() + ortho_inputs_integrals[1].cuda() *
+                                mask_parts[1].cuda()
+                                , ortho_inputs_integrals[1].cuda())
+
                             loss_ortho_val = loss_ortho_id_L1_val + loss_ortho_id_BCE_val
                             ''''''
                             # w_ini = 0.5
@@ -351,11 +360,11 @@ class Solver(object):
                             w_ini = 100
                             decay_rate = 0.999
                             decay_steps = 12500
-                            w_decay = w_ini * math.pow(decay_rate, (i+1) / decay_steps)
-                            
+                            w_decay = w_ini * math.pow(decay_rate, (i + 1) / decay_steps)
+
                             ''''''
                             loss_overall_id = self.w_main * w_decay * loss_main_val + self.w_ortho * loss_ortho_val
-                            loss_overall_id = loss_overall_id / (w_ini*self.w_main)
+                            loss_overall_id = loss_overall_id / (w_ini * self.w_main)
                             # loss_overall_id = self.w_main * loss_main_val + self.w_ortho * loss_ortho_val
                             # 分别的 loss list
                             loss_overall_val_list.append(loss_overall_id.item())
@@ -366,22 +375,23 @@ class Solver(object):
                 val_main_loss = np.mean(loss_main_val_list)
                 val_ortho_loss = np.mean(loss_ortho_val_list)
                 val_frame_main_loss = np.mean(loss_frame_main_val_list)
-                print('Validation overall loss : {}, main loss: {}, ortho loss: {}, frame_main_loss:{}'.format(val_overall_loss, val_main_loss, val_ortho_loss,val_frame_main_loss))
-
-                self.logger.log_validation(self.model, x_real_pad, mel_outputs, i + 1)
+                print('Validation overall loss : {}, main loss: {}, ortho loss: {}, frame_main_loss:{}'.format(
+                    val_overall_loss, val_main_loss, val_ortho_loss, val_frame_main_loss), flush=True)
+                y_pred = [mel_outputs, alignments[0], alignments[1], alignments[2]]
+                # y = mel_targets
+                self.logger.log_validation(self.model, y=x_real_pad, y_pred=y_pred, iteration=i + 1)
                 if self.use_tensorboard:
                     self.writer.add_scalar('Validation_overall_loss', val_overall_loss, i + 1)
                     self.writer.add_scalar('Validation_main_loss', val_main_loss, i + 1)
                     self.writer.add_scalar('Validation_frame_main_loss', val_frame_main_loss, i + 1)
                     self.writer.add_scalar('Validation_ortho_loss', val_ortho_loss, i + 1)
 
-
             # plot test samples
             if (i + 1) % self.sample_step == 0:
                 self.model = self.model.eval()
                 with torch.no_grad():
                     for val_sub in validation_pt[:3]:
-                        emb_org_val = torch.from_numpy(val_sub[1][np.newaxis,:]).to(self.device)
+                        emb_org_val = torch.from_numpy(val_sub[1][np.newaxis, :]).to(self.device)
                         for k in range(2, 3):
                             x_real_pad, _ = pad_seq_to_2(val_sub[k][0][np.newaxis, :, :], 408)
                             len_org = torch.tensor([val_sub[k][2]]).to(self.device)
@@ -395,11 +405,16 @@ class Solver(object):
                             x_f0_F = torch.cat((x_real_pad, torch.zeros_like(f0_org_val)), dim=-1)
                             x_f0_C = torch.cat((torch.zeros_like(x_real_pad), f0_org_val), dim=-1)
 
-                            x_identic_val,_ , _, _, _ = self.model(x_f0, x_real_pad, emb_org_val, len_org, len_org, len_org)
-                            x_identic_woF,_ , _, _, _  = self.model(x_f0_F, x_real_pad, emb_org_val, len_org, len_org, len_org)
-                            x_identic_woR,_ , _, _, _  = self.model(x_f0, torch.zeros_like(x_real_pad), emb_org_val, len_org, len_org, len_org)
-                            x_identic_woC,_ , _, _, _  = self.model(x_f0_C, x_real_pad, emb_org_val, len_org, len_org, len_org)
-                            x_identic_woU,_ , _, _, _  = self.model(x_f0, x_real_pad, torch.zeros_like(emb_org_val), len_org, len_org, len_org)
+                            x_identic_val, _, _, _, _, _ = self.model(x_f0, x_real_pad, emb_org_val, len_org, len_org,
+                                                                      len_org)
+                            x_identic_woF, _, _, _, _, _ = self.model(x_f0_F, x_real_pad, emb_org_val, len_org, len_org,
+                                                                      len_org)
+                            x_identic_woR, _, _, _, _, _ = self.model(x_f0, torch.zeros_like(x_real_pad), emb_org_val,
+                                                                      len_org, len_org, len_org)
+                            x_identic_woC, _, _, _, _, _ = self.model(x_f0_C, x_real_pad, emb_org_val, len_org, len_org,
+                                                                      len_org)
+                            x_identic_woU, _, _, _, _, _ = self.model(x_f0, x_real_pad, torch.zeros_like(emb_org_val),
+                                                                      len_org, len_org, len_org)
 
                             melsp_gd_pad = x_real_pad[0].cpu().numpy().T
                             # ground truth
@@ -414,10 +429,12 @@ class Solver(object):
                             melsp_woU = x_identic_woU[0].cpu().numpy().T
                             # 没有U
 
-                            min_value = np.min(np.hstack([melsp_gd_pad, melsp_out, melsp_woF, melsp_woR, melsp_woC,melsp_woU]))
-                            max_value = np.max(np.hstack([melsp_gd_pad, melsp_out, melsp_woF, melsp_woR, melsp_woC,melsp_woU]))
+                            min_value = np.min(
+                                np.hstack([melsp_gd_pad, melsp_out, melsp_woF, melsp_woR, melsp_woC, melsp_woU]))
+                            max_value = np.max(
+                                np.hstack([melsp_gd_pad, melsp_out, melsp_woF, melsp_woR, melsp_woC, melsp_woU]))
 
-                            fig, (ax1, ax2, ax3, ax4, ax5,ax6) = plt.subplots(6, 1, sharex=True)
+                            fig, (ax1, ax2, ax3, ax4, ax5, ax6) = plt.subplots(6, 1, sharex=True)
                             im1 = ax1.imshow(melsp_gd_pad, aspect='auto', vmin=min_value, vmax=max_value)
                             im2 = ax2.imshow(melsp_out, aspect='auto', vmin=min_value, vmax=max_value)
                             im3 = ax3.imshow(melsp_woC, aspect='auto', vmin=min_value, vmax=max_value)
@@ -428,19 +445,19 @@ class Solver(object):
                             plt.close(fig)
 
 
-def get_Rhythm_Encoder_parameters(pretrained_model_path,Mymodel):
+def get_Rhythm_Encoder_parameters(pretrained_model_path, Mymodel):
     pretrained_model = torch.load(pretrained_model_path)
     Layers = pretrained_model['model'].items()
     My_Layers_dict = Mymodel.state_dict()
-    state_dict = {k:v for k,v in Layers if k.split('_')[1][0]=='2'}# encoder_2. is rhythm encoder
-    #get_rhythm_encoder
+    state_dict = {k: v for k, v in Layers if k.split('_')[1][0] == '2'}  # encoder_2. is rhythm encoder
+    # get_rhythm_encoder
     My_Layers_dict.update(state_dict)
     Mymodel.load_state_dict(My_Layers_dict)
 
-    #frozen rhythm
+    # frozen rhythm
 
     # for param in Mymodel.named_parameters():
     #     if param[0] in state_dict: #frozen rhythm encoder
     #         param[1].requires_grad = False
 
-    return Mymodel,state_dict
+    return Mymodel, state_dict
